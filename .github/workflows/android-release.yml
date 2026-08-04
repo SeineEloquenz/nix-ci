@@ -1,0 +1,188 @@
+name: Android Release
+
+# The caller must grant `contents: write` on the job that calls this workflow.
+#
+# Secrets (pass explicitly or via `secrets: inherit`):
+#   KEYSTORE              base64-encoded upload keystore (.jks); decoded to ${RUNNER_TEMP}/keystore.jks
+#   KEYSTORE_PASSWORD     keystore password
+#   SIGNING_KEY_ALIAS     key alias
+#   SIGNING_KEY_PASSWORD  key password
+#   SERVICE_ACCOUNT_JSON  Play service-account JSON (only required when publish-play is true)
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the Gradle project (where ./gradlew lives).
+        type: string
+        default: "."
+      java-version:
+        description: Temurin JDK version.
+        type: string
+        default: "21"
+      version-file:
+        description: File to read versionCode/versionName from, relative to working-directory.
+        type: string
+        default: app/build.gradle.kts
+      test-task:
+        description: Gradle task run before building. Leave empty to skip tests.
+        type: string
+        default: testDebugUnitTest
+      assemble-task:
+        description: Gradle task that assembles the release APK.
+        type: string
+        default: assembleRelease
+      bundle-task:
+        description: Gradle task that builds the release AAB (only used when publish-play is true).
+        type: string
+        default: bundleRelease
+      apk-path:
+        description: Directory holding the built release APK(s), relative to working-directory.
+        type: string
+        default: app/build/outputs/apk/release
+      bundle-path:
+        description: Directory holding the built release AAB(s), relative to working-directory.
+        type: string
+        default: app/build/outputs/bundle/release
+      fastlane-dir:
+        description: Fastlane metadata dir (holds <locale>/changelogs/<versionCode>.txt), relative to working-directory.
+        type: string
+        default: fastlane/metadata/android
+      setup-rust:
+        description: Install cargo-ndk and the Android Rust targets before building (for apps with a Rust component).
+        type: boolean
+        default: false
+      publish-play:
+        description: Build an AAB and publish it to Google Play.
+        type: boolean
+        default: false
+      play-package-name:
+        description: Application id to publish under (required when publish-play is true).
+        type: string
+        default: ""
+      play-track:
+        description: Google Play track to publish to.
+        type: string
+        default: production
+      play-status:
+        description: Google Play release status.
+        type: string
+        default: completed
+    secrets:
+      KEYSTORE:
+        required: true
+      KEYSTORE_PASSWORD:
+        required: true
+      SIGNING_KEY_ALIAS:
+        required: true
+      SIGNING_KEY_PASSWORD:
+        required: true
+      SERVICE_ACCOUNT_JSON:
+        required: false
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read versionCode and versionName
+        id: version
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          VERSION_CODE=$(grep -m1 'versionCode' "${{ inputs.version-file }}" | sed 's/[^0-9]*//g')
+          VERSION_NAME=$(grep -m1 'versionName' "${{ inputs.version-file }}" \
+            | sed -E 's/.*versionName[^=]*=[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')
+          echo "versionCode=$VERSION_CODE versionName=$VERSION_NAME"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Copy CI gradle.properties
+        run: mkdir -p ~/.gradle && cp .github/ci-gradle.properties ~/.gradle/gradle.properties
+
+      - name: Decode keystore
+        env:
+          ENCODED_STRING: ${{ secrets.KEYSTORE }}
+        run: echo "$ENCODED_STRING" | base64 -di > "${RUNNER_TEMP}/keystore.jks"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup cargo-ndk and Android Rust targets
+        if: ${{ inputs.setup-rust }}
+        run: |
+          cargo install cargo-ndk
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+
+      - name: Build release APK
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: ./gradlew ${{ inputs.test-task }} ${{ inputs.assemble-task }}
+
+      - name: Build release bundle
+        if: ${{ inputs.publish-play }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: ./gradlew ${{ inputs.bundle-task }}
+
+      - name: Prepare changelog and Play release notes
+        id: notes
+        env:
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          FASTLANE_DIR: ${{ inputs.working-directory }}/${{ inputs.fastlane-dir }}
+        run: |
+          changelog="${RUNNER_TEMP}/changelog.txt"
+          en_changelog="${FASTLANE_DIR}/en-US/changelogs/${VERSION_CODE}.txt"
+          if [ -f "$en_changelog" ]; then
+            cp "$en_changelog" "$changelog"
+          else
+            echo "Release ${VERSION_NAME}" > "$changelog"
+            echo "No changelog at $en_changelog; falling back to a generic release body."
+          fi
+          echo "changelog=$changelog" >> "$GITHUB_OUTPUT"
+
+          # Per-locale "whatsnew" for Google Play.
+          whatsnew="${RUNNER_TEMP}/whatsnew"
+          mkdir -p "$whatsnew"
+          if [ -d "$FASTLANE_DIR" ]; then
+            for locale_dir in "$FASTLANE_DIR"/*; do
+              [ -d "$locale_dir" ] || continue
+              locale=$(basename "$locale_dir")
+              file="$locale_dir/changelogs/${VERSION_CODE}.txt"
+              if [ -f "$file" ]; then
+                cp "$file" "$whatsnew/whatsnew-$locale"
+                echo "Prepared release notes for $locale"
+              fi
+            done
+          fi
+          echo "whatsnew=$whatsnew" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ inputs.working-directory }}/${{ inputs.apk-path }}/*.apk
+          body_path: ${{ steps.notes.outputs.changelog }}
+
+      - name: Publish to Google Play
+        if: ${{ inputs.publish-play }}
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.play-package-name }}
+          releaseFiles: ${{ inputs.working-directory }}/${{ inputs.bundle-path }}/*.aab
+          track: ${{ inputs.play-track }}
+          status: ${{ inputs.play-status }}
+          whatsNewDirectory: ${{ steps.notes.outputs.whatsnew }}
