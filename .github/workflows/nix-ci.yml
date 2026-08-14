@@ -91,7 +91,7 @@ jobs:
         id: meta
         run: |
           repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          image="ghcr.io/${repo}"
+          image="ghcr.io/${repo}/${{ matrix.package }}"
           if [ "${{ github.ref_type }}" = "tag" ]; then
             version="${{ github.ref_name }}"
             version="${version#v}"
