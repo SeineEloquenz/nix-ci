@@ -56,7 +56,9 @@ jobs:
           }
 
           entries='[]'
-          systems=$(nix eval --json .#packages --apply builtins.attrNames 2>/dev/null || echo '[]')
+          pkg_systems=$(nix eval --json .#packages --apply builtins.attrNames 2>/dev/null || echo '[]')
+          shell_systems=$(nix eval --json .#devShells --apply builtins.attrNames 2>/dev/null || echo '[]')
+          systems=$(jq -cn --argjson p "$pkg_systems" --argjson s "$shell_systems" '($p + $s) | unique')
           for system in $(echo "$systems" | jq -r '.[]'); do
             runner=$(runner_for "$system")
             [ -n "$runner" ] || continue
@@ -77,6 +79,7 @@ jobs:
   build:
     runs-on: ${{ matrix.entry.runner }}
     needs: [flake-check, generate-matrix]
+    if: ${{ needs.generate-matrix.outputs.matrix != '[]' }}
     permissions:
       contents: read
       packages: write
