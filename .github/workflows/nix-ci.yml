@@ -7,6 +7,10 @@ on:
         description: JSON array of flake package names to publish as OCI images to GHCR
         type: string
         default: '[]'
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        description: Auth token for pushing to the shared Cachix binary cache
+        required: false
   push:
     branches: [main]
   pull_request:
@@ -30,7 +34,7 @@ jobs:
   generate-matrix:
     runs-on: ubuntu-latest
     outputs:
-      packages: ${{ steps.set-matrix.outputs.packages }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
 
@@ -43,20 +47,42 @@ jobs:
 
       - id: set-matrix
         run: |
-          packages=$(nix eval --json .#packages.x86_64-linux --apply builtins.attrNames 2>/dev/null || echo '[]')
-          devShells=$(nix eval --json .#devShells.x86_64-linux --apply \
-            'shells: builtins.map (k: "devShells.x86_64-linux.${k}") (builtins.attrNames shells)' 2>/dev/null || echo '[]')
-          echo "packages=$(jq -cn --argjson p "$packages" --argjson d "$devShells" '$p + $d')" >> "$GITHUB_OUTPUT"
+          runner_for() {
+            case "$1" in
+              x86_64-linux) echo ubuntu-latest ;;
+              aarch64-linux) echo ubuntu-24.04-arm ;;
+              *) echo "" ;;
+            esac
+          }
+
+          entries='[]'
+          systems=$(nix eval --json .#packages --apply builtins.attrNames 2>/dev/null || echo '[]')
+          for system in $(echo "$systems" | jq -r '.[]'); do
+            runner=$(runner_for "$system")
+            [ -n "$runner" ] || continue
+
+            packages=$(nix eval --json ".#packages.$system" --apply builtins.attrNames 2>/dev/null || echo '[]')
+            entries=$(jq -cn --argjson e "$entries" --argjson p "$packages" \
+              --arg sys "$system" --arg run "$runner" \
+              '$e + [ $p[] | { system: $sys, runner: $run, attr: "packages.\($sys).\(.)", name: ., kind: "package" } ]')
+
+            shells=$(nix eval --json ".#devShells.$system" --apply builtins.attrNames 2>/dev/null || echo '[]')
+            entries=$(jq -cn --argjson e "$entries" --argjson s "$shells" \
+              --arg sys "$system" --arg run "$runner" \
+              '$e + [ $s[] | { system: $sys, runner: $run, attr: "devShells.\($sys).\(.)", name: ., kind: "devShell" } ]')
+          done
+
+          echo "matrix=$entries" >> "$GITHUB_OUTPUT"
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.entry.runner }}
     needs: [flake-check, generate-matrix]
     permissions:
       contents: read
       packages: write
     strategy:
       matrix:
-        package: ${{ fromJson(needs.generate-matrix.outputs.packages) }}
+        entry: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -67,13 +93,19 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@v14
 
-      - name: Build ${{ matrix.package }}
-        run: nix build .#${{ matrix.package }}
+      - uses: cachix/cachix-action@v15
+        with:
+          name: seineeloquenz
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
-      # Publish container images
+      - name: Build ${{ matrix.entry.attr }}
+        run: nix build .#${{ matrix.entry.attr }}
+
+      # Publish per-arch container images; the multi-arch manifest is assembled in the manifest job.
       - name: Is this package a publishable image?
         id: gate
-        if: ${{ inputs.images != '' && contains(fromJson(inputs.images), matrix.package) }}
+        if: ${{ matrix.entry.kind == 'package' && inputs.images != '' && contains(fromJson(inputs.images), matrix.entry.name) }}
         run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref_type }}" = "tag" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
@@ -86,20 +118,17 @@ jobs:
           image_id=$(docker load -q -i result | sed -n 's/^Loaded image: //p')
           echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
 
-      - name: Compute image ref & tags
+      - name: Compute per-arch image ref
         if: ${{ steps.gate.outputs.publish == 'true' }}
         id: meta
         run: |
           repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          image="ghcr.io/${repo}/${{ matrix.package }}"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            version="${{ github.ref_name }}"
-            version="${version#v}"
-            tags="${image}:${version} ${image}:latest"
-          else
-            tags="${image}:latest ${image}:sha-${GITHUB_SHA::7}"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          case "${{ matrix.entry.system }}" in
+            x86_64-linux) arch=amd64 ;;
+            aarch64-linux) arch=arm64 ;;
+            *) echo "unsupported system ${{ matrix.entry.system }}"; exit 1 ;;
+          esac
+          echo "tag=ghcr.io/${repo}/${{ matrix.entry.name }}:sha-${GITHUB_SHA::7}-${arch}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         if: ${{ steps.gate.outputs.publish == 'true' }}
@@ -109,11 +138,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tag & push
+      - name: Tag & push per-arch image
         if: ${{ steps.gate.outputs.publish == 'true' }}
         run: |
-          for tag in ${{ steps.meta.outputs.tags }}; do
-            echo "Pushing $tag"
-            docker tag "${{ steps.load.outputs.image_id }}" "$tag"
-            docker push "$tag"
+          echo "Pushing ${{ steps.meta.outputs.tag }}"
+          docker tag "${{ steps.load.outputs.image_id }}" "${{ steps.meta.outputs.tag }}"
+          docker push "${{ steps.meta.outputs.tag }}"
+
+  manifest:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ inputs.images != '' && inputs.images != '[]' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: ${{ fromJson(inputs.images) }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge per-arch tags into multi-arch manifest
+        run: |
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${repo}/${{ matrix.image }}"
+          short=${GITHUB_SHA::7}
+          sources="${image}:sha-${short}-amd64 ${image}:sha-${short}-arm64"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+            version="${version#v}"
+            finals="${image}:${version} ${image}:latest"
+          else
+            finals="${image}:latest ${image}:sha-${short}"
+          fi
+          for final in $finals; do
+            echo "Creating manifest $final from $sources"
+            docker buildx imagetools create -t "$final" $sources
           done
