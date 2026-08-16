@@ -56,6 +56,7 @@ jobs:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
         entry: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     steps:
