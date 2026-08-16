@@ -16,6 +16,9 @@
         check-android-versions =
           nixpkgs.legacyPackages.${system}.callPackage ./pkgs/check-android-versions
             { };
+        flake-ci-matrix =
+          nixpkgs.legacyPackages.${system}.callPackage ./pkgs/flake-ci-matrix
+            { };
       });
     };
 }

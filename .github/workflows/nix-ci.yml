@@ -46,35 +46,7 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@v14
 
       - id: set-matrix
-        run: |
-          runner_for() {
-            case "$1" in
-              x86_64-linux) echo ubuntu-latest ;;
-              aarch64-linux) echo ubuntu-24.04-arm ;;
-              *) echo "" ;;
-            esac
-          }
-
-          entries='[]'
-          pkg_systems=$(nix eval --json .#packages --apply builtins.attrNames 2>/dev/null || echo '[]')
-          shell_systems=$(nix eval --json .#devShells --apply builtins.attrNames 2>/dev/null || echo '[]')
-          systems=$(jq -cn --argjson p "$pkg_systems" --argjson s "$shell_systems" '($p + $s) | unique')
-          for system in $(echo "$systems" | jq -r '.[]'); do
-            runner=$(runner_for "$system")
-            [ -n "$runner" ] || continue
-
-            packages=$(nix eval --json ".#packages.$system" --apply builtins.attrNames 2>/dev/null || echo '[]')
-            entries=$(jq -cn --argjson e "$entries" --argjson p "$packages" \
-              --arg sys "$system" --arg run "$runner" \
-              '$e + [ $p[] | { system: $sys, runner: $run, attr: "packages.\($sys).\(.)", name: ., kind: "package" } ]')
-
-            shells=$(nix eval --json ".#devShells.$system" --apply builtins.attrNames 2>/dev/null || echo '[]')
-            entries=$(jq -cn --argjson e "$entries" --argjson s "$shells" \
-              --arg sys "$system" --arg run "$runner" \
-              '$e + [ $s[] | { system: $sys, runner: $run, attr: "devShells.\($sys).\(.)", name: ., kind: "devShell" } ]')
-          done
-
-          echo "matrix=$entries" >> "$GITHUB_OUTPUT"
+        run: echo "matrix=$(nix run github:SeineEloquenz/ci#flake-ci-matrix)" >> "$GITHUB_OUTPUT"
 
   build:
     runs-on: ${{ matrix.entry.runner }}
