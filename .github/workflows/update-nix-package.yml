@@ -1,0 +1,145 @@
+name: Update Nix Package
+
+# Needs `contents: write` and `pull-requests: write`, and the repository must
+# allow GitHub Actions to create pull requests.
+#
+# The package needs a `version` attribute and a source nix-update can resolve
+# (fetchFromGitHub, fetchFromGitLab, PyPI, crates.io, ...).
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: Flake attribute of the package to bump, as passed to `nix build .#<attr>`.
+        type: string
+        required: true
+      package-file:
+        description: Package definition to write the bump into. Defaults to the file the attribute is defined in.
+        type: string
+        default: ""
+      version:
+        description: "Version to bump to: stable, unstable, branch, or a literal version."
+        type: string
+        default: stable
+      version-regex:
+        description: Regex extracting the version from an upstream tag, i.e. 'somedl-(.*)'.
+        type: string
+        default: ""
+      use-github-releases:
+        description: Read versions from the GitHub releases API instead of the tag atom feed.
+        type: boolean
+        default: false
+      build:
+        description: Build the package after bumping, so a broken bump never reaches a pull request.
+        type: boolean
+        default: true
+      working-directory:
+        description: Directory containing the flake.
+        type: string
+        default: "."
+      base:
+        description: Branch to open the pull request against. Defaults to the branch the workflow runs on.
+        type: string
+        default: ""
+    outputs:
+      updated:
+        description: Whether a new version was found and written.
+        value: ${{ jobs.update.outputs.updated }}
+      old-version:
+        description: Version before the bump.
+        value: ${{ jobs.update.outputs.old-version }}
+      new-version:
+        description: Version after the bump, empty when nothing was updated.
+        value: ${{ jobs.update.outputs.new-version }}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      updated: ${{ steps.update.outputs.updated }}
+      old-version: ${{ steps.update.outputs.old_version }}
+      new-version: ${{ steps.update.outputs.new_version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      - name: Bump ${{ inputs.package }}
+        id: update
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE: ${{ inputs.package }}
+          PACKAGE_FILE: ${{ inputs.package-file }}
+          VERSION: ${{ inputs.version }}
+          VERSION_REGEX: ${{ inputs.version-regex }}
+          USE_GITHUB_RELEASES: ${{ inputs.use-github-releases }}
+        run: |
+          old=$(nix eval --raw ".#$PACKAGE.version")
+          echo "Current version: $old"
+          echo "old_version=$old" >> "$GITHUB_OUTPUT"
+
+          args=(--flake --version "$VERSION")
+          if [ -n "$VERSION_REGEX" ]; then
+            args+=(--version-regex "$VERSION_REGEX")
+          fi
+          if [ -n "$PACKAGE_FILE" ]; then
+            args+=(--override-filename "$PACKAGE_FILE")
+          fi
+          if [ "$USE_GITHUB_RELEASES" = "true" ]; then
+            args+=(--use-github-releases)
+          fi
+
+          message="$RUNNER_TEMP/commit-message.txt"
+          nix run github:SeineEloquenz/ci#nix-update -- \
+            "${args[@]}" --write-commit-message "$message" "$PACKAGE"
+
+          if git diff --quiet; then
+            echo "$PACKAGE is already up to date at $old."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          new=$(nix eval --raw ".#$PACKAGE.version")
+          echo "Bumped $PACKAGE from $old to $new."
+
+          {
+            echo "updated=true"
+            echo "new_version=$new"
+            echo "title=$(head -1 "$message")"
+            echo "body<<GHADELIMITER"
+            cat "$message"
+            echo
+            echo "---"
+            echo "_This pull request was generated automatically by a GitHub Actions workflow._"
+            echo "GHADELIMITER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build ${{ inputs.package }}
+        if: ${{ inputs.build && steps.update.outputs.updated == 'true' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: nix build --no-link ".#$PACKAGE"
+
+      - name: Create or update pull request
+        if: steps.update.outputs.updated == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: ${{ inputs.base }}
+          branch: update/${{ inputs.package }}
+          delete-branch: true
+          commit-message: ${{ steps.update.outputs.title }}
+          title: ${{ steps.update.outputs.title }}
+          body: ${{ steps.update.outputs.body }}

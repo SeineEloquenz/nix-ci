@@ -13,6 +13,7 @@
     in
     {
       packages = nixpkgs.lib.genAttrs systems (system: {
+        inherit (nixpkgs.legacyPackages.${system}) nix-update;
         check-android-versions =
           nixpkgs.legacyPackages.${system}.callPackage ./pkgs/check-android-versions
             { };
